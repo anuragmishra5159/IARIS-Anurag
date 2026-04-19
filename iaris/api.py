@@ -53,6 +53,10 @@ class WorkloadConfig(BaseModel):
     priority: float = 0.5
 
 
+class IntelligenceRefreshRequest(BaseModel):
+    force_external: bool = True
+
+
 # ─── WebSocket Manager ───────────────────────────────────────────────────────
 
 class ConnectionManager:
@@ -419,6 +423,18 @@ async def get_intelligence():
     if not engine:
         raise HTTPException(503, "Engine not initialized")
     return engine.get_state().get("intelligence", {})
+
+
+@app.post("/api/intelligence/refresh")
+async def refresh_intelligence(req: IntelligenceRefreshRequest):
+    """Manually refresh intelligence and optionally force external API call."""
+    if not engine:
+        raise HTTPException(503, "Engine not initialized")
+    intelligence = engine.refresh_intelligence(force_external=req.force_external)
+    return {
+        "status": "refreshed",
+        "intelligence": intelligence,
+    }
 
 
 @app.get("/api/efficiency")

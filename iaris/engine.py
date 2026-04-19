@@ -128,6 +128,15 @@ class IARISEngine:
             "last_updated": self._system.timestamp,
             "cache_age_seconds": 0,
             "cache_ttl_seconds": 45,
+            "forced_refresh": False,
+            "gemini": {
+                "enabled": False,
+                "attempted": False,
+                "status": "not_configured",
+                "message": "Gemini integration not configured.",
+                "api_version": "",
+                "model": "",
+            },
         }
 
     @property
@@ -436,6 +445,17 @@ class IARISEngine:
     def get_credential_status(self) -> dict:
         """Safe credential status for diagnostics and UI."""
         return self._credentials.status()
+
+    def refresh_intelligence(self, force_external: bool = True) -> dict:
+        """Force-refresh intelligence payload, optionally forcing external API attempt."""
+        self._latest_intelligence = self._intelligence.evaluate(
+            observability=self._latest_observability,
+            engine_insights=self._latest_insights,
+            credentials=self._credentials.get_store(),
+            force_refresh=True,
+            force_external=force_external,
+        )
+        return self._latest_intelligence
 
     def get_state(self) -> dict:
         """Get complete engine state as a dictionary (for API/UI consumption)."""

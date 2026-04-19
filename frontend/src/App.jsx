@@ -24,7 +24,8 @@ import {
   Loader,
   Check,
   FlaskConical,
-  ArrowRight
+  ArrowRight,
+  RefreshCw
 } from 'lucide-react';
 import {
   XAxis,
@@ -399,10 +400,26 @@ function App() {
     insights: [],
     efficiency: { overall: 0, cpu: 0, memory: 0, latency: 0, process_balance: 50 },
     observability: { snapshot: {}, diff: {}, changes: [], recent_changes: [], significant: false, significance_reason: '' },
-    intelligence: { significant: false, reason: '', used_cache: false, source: 'local', insight: '', last_updated: 0 },
+    intelligence: {
+      significant: false,
+      reason: '',
+      used_cache: false,
+      source: 'local',
+      insight: '',
+      last_updated: 0,
+      gemini: {
+        enabled: false,
+        attempted: false,
+        status: 'not_configured',
+        message: 'Gemini integration not configured.',
+        api_version: '',
+        model: '',
+      },
+    },
   });
 
   const [history, setHistory] = useState([]);
+  const [intelligenceTimeline, setIntelligenceTimeline] = useState([]);
   
   // Interaction Layer specific states
   const [isIarisActive, setIsIarisActive] = useState(true);
@@ -411,6 +428,7 @@ function App() {
   const [activeProcessId, setActiveProcessId] = useState(null);
   const [toastMessage, setToastMessage] = useState(null);
   const [activeTab, setActiveTab] = useState('VISUALIZATION');
+  const [isManualRefreshing, setIsManualRefreshing] = useState(false);
 
   // ═══════════════════════════════════════════════════════════════════════
   // FEEDBACK LAYER STATE
@@ -659,6 +677,60 @@ function App() {
     }
   };
 
+  const manualRefreshFromApi = async () => {
+    if (isManualRefreshing) return;
+
+    setIsManualRefreshing(true);
+    let refreshWarning = '';
+
+    try {
+      try {
+        const refreshResp = await fetch(`${API_BASE}/intelligence/refresh`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ force_external: true }),
+        });
+        if (!refreshResp.ok) {
+          refreshWarning = `Intelligence refresh unavailable (${refreshResp.status}).`;
+        }
+      } catch {
+        refreshWarning = 'Intelligence refresh unavailable.';
+      }
+
+      const stateResp = await fetch(`${API_BASE}/state`);
+      if (!stateResp.ok) {
+        throw new Error(`API error: ${stateResp.status}`);
+      }
+
+      const stateData = await stateResp.json();
+      setGameState(stateData);
+
+      setHistory((prev) => {
+        const next = [...prev, {
+          time: stateData.tick_count,
+          cpu: stateData.system?.cpu_percent ?? 0,
+          memory: stateData.system?.memory_percent ?? 0,
+          unop_cpu: stateData.system?.cpu_percent ?? 0,
+          stability: stateData.efficiency?.process_balance ?? 0,
+          latency: stateData.efficiency?.latency ?? 0,
+          efficiency: stateData.efficiency?.overall ?? 0,
+        }];
+        return next.length > 60 ? next.slice(next.length - 60) : next;
+      });
+
+      const statusMsg = refreshWarning
+        ? `Manual refresh complete. ${refreshWarning}`
+        : 'Manual refresh complete. Pulled latest state from API.';
+      setToastMessage(statusMsg);
+      setTimeout(() => setToastMessage(null), 4000);
+    } catch (e) {
+      setToastMessage(`Manual refresh failed: ${e.message}`);
+      setTimeout(() => setToastMessage(null), 5000);
+    } finally {
+      setIsManualRefreshing(false);
+    }
+  };
+
   const triggerOverride = (pid, action, pName) => {
     let msg = "";
     if (action === "Force Priority") {
@@ -688,8 +760,52 @@ function App() {
 
   const sys = gameState.system || {};
   const observability = gameState.observability || { snapshot: {}, diff: {}, changes: [], recent_changes: [] };
-  const intelligence = gameState.intelligence || { insight: '', reason: '', used_cache: false, source: 'local', significant: false, last_updated: 0 };
+  const intelligence = gameState.intelligence || {
+    insight: '',
+    reason: '',
+    used_cache: false,
+    source: 'local',
+    significant: false,
+    last_updated: 0,
+    gemini: {
+      enabled: false,
+      attempted: false,
+      status: 'not_configured',
+      message: 'Gemini integration not configured.',
+      api_version: '',
+      model: '',
+    },
+  };
   const recentChanges = (observability.recent_changes || []).slice(-10).reverse();
+  const geminiMeta = intelligence.gemini || {
+    enabled: false,
+    attempted: false,
+    status: 'not_configured',
+    message: 'Gemini integration not configured.',
+    api_version: '',
+    model: '',
+  };
+  const recommendationForSummary = (gameState.insights || []).find((ins) => ins.type === 'recommendation');
+
+  let confidenceLabel = 'Low';
+  let confidenceScore = 35;
+  if (intelligence.source === 'gemini') {
+    confidenceLabel = intelligence.significant ? 'High' : 'Medium';
+    confidenceScore = intelligence.significant ? 92 : 72;
+  } else if (intelligence.used_cache) {
+    confidenceLabel = 'Medium';
+    confidenceScore = 68;
+  } else if (intelligence.significant) {
+    confidenceLabel = 'Medium';
+    confidenceScore = 60;
+  }
+
+  const geminiBadgeClass = (() => {
+    if (geminiMeta.status === 'success') return 'badge-green';
+    if (geminiMeta.status === 'rate_limited' || geminiMeta.status === 'http_error') return 'badge-critical';
+    if (geminiMeta.status === 'model_unavailable' || geminiMeta.status === 'network_error') return 'badge-yellow';
+    return 'badge-outline';
+  })();
   
   // Latest decision for Action Banner
   const latestDecision = gameState.decisions && gameState.decisions.length > 0 && isIarisActive
@@ -737,6 +853,37 @@ function App() {
     }
   }, [gameState.tick_count]);
 
+  useEffect(() => {
+    const intel = gameState.intelligence;
+    if (!intel || !intel.last_updated) return;
+
+    const nextEntry = {
+      tick: gameState.tick_count,
+      updated_at: intel.last_updated,
+      source: intel.source,
+      significant: intel.significant,
+      used_cache: intel.used_cache,
+      reason: intel.reason || '',
+      insight: intel.insight || '',
+      gemini_status: intel.gemini?.status || 'unknown',
+      gemini_message: intel.gemini?.message || '',
+    };
+
+    setIntelligenceTimeline((prev) => {
+      const last = prev[prev.length - 1];
+      if (
+        last &&
+        last.updated_at === nextEntry.updated_at &&
+        last.insight === nextEntry.insight &&
+        last.source === nextEntry.source
+      ) {
+        return prev;
+      }
+      const next = [...prev, nextEntry];
+      return next.length > 240 ? next.slice(next.length - 240) : next;
+    });
+  }, [gameState.tick_count, gameState.intelligence]);
+
   // Compute graph marker positions relative to the chart
   const markerPositions = graphMarkers.filter(m => {
     const idx = history.findIndex(h => h.time >= m.tick);
@@ -783,6 +930,130 @@ function App() {
     if (!unixTs) return '--:--:--';
     return new Date(unixTs * 1000).toLocaleTimeString();
   };
+
+  const downloadBlob = (content, fileName, mimeType) => {
+    const blob = new Blob([content], { type: mimeType });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    anchor.download = fileName;
+    document.body.appendChild(anchor);
+    anchor.click();
+    document.body.removeChild(anchor);
+    URL.revokeObjectURL(url);
+  };
+
+  const escapeCsv = (value) => {
+    const safe = String(value ?? '');
+    if (safe.includes(',') || safe.includes('"') || safe.includes('\n')) {
+      return `"${safe.replace(/"/g, '""')}"`;
+    }
+    return safe;
+  };
+
+  const buildCsv = (rows) => {
+    if (!rows || rows.length === 0) return '';
+    const headers = Object.keys(rows[0]);
+    const lines = [headers.join(',')];
+    rows.forEach((row) => {
+      lines.push(headers.map((header) => escapeCsv(row[header])).join(','));
+    });
+    return lines.join('\n');
+  };
+
+  const escapeXml = (value) => String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&apos;');
+
+  const buildExcelXml = (sheetName, rows) => {
+    if (!rows || rows.length === 0) return '';
+    const headers = Object.keys(rows[0]);
+
+    const headerRow = `<Row>${headers
+      .map((header) => `<Cell><Data ss:Type="String">${escapeXml(header)}</Data></Cell>`)
+      .join('')}</Row>`;
+
+    const dataRows = rows.map((row) => {
+      const cells = headers.map((header) => {
+        const raw = row[header];
+        const isNumber = typeof raw === 'number' && Number.isFinite(raw);
+        const type = isNumber ? 'Number' : 'String';
+        const value = isNumber ? raw : escapeXml(raw);
+        return `<Cell><Data ss:Type="${type}">${value}</Data></Cell>`;
+      });
+      return `<Row>${cells.join('')}</Row>`;
+    }).join('');
+
+    return `<?xml version="1.0"?>
+<Workbook xmlns="urn:schemas-microsoft-com:office:spreadsheet"
+ xmlns:o="urn:schemas-microsoft-com:office:office"
+ xmlns:x="urn:schemas-microsoft-com:office:excel"
+ xmlns:ss="urn:schemas-microsoft-com:office:spreadsheet"
+ xmlns:html="http://www.w3.org/TR/REC-html40">
+ <Worksheet ss:Name="${escapeXml(sheetName)}">
+  <Table>
+   ${headerRow}
+   ${dataRows}
+  </Table>
+ </Worksheet>
+</Workbook>`;
+  };
+
+  const exportDataset = (datasetName, rows, format) => {
+    if (!rows || rows.length === 0) {
+      setToastMessage(`No ${datasetName} data available to export yet.`);
+      setTimeout(() => setToastMessage(null), 4000);
+      return;
+    }
+
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    if (format === 'csv') {
+      const csv = buildCsv(rows);
+      downloadBlob(csv, `${datasetName}-${stamp}.csv`, 'text/csv;charset=utf-8;');
+      return;
+    }
+
+    const xml = buildExcelXml(datasetName, rows);
+    downloadBlob(xml, `${datasetName}-${stamp}.xls`, 'application/vnd.ms-excel;charset=utf-8;');
+  };
+
+  const insightsSheetRows = (gameState.insights || []).map((ins, index) => ({
+    row: index + 1,
+    tick: gameState.tick_count,
+    type: ins.type,
+    severity: ins.severity,
+    message: ins.message,
+    recommendation: ins.recommendation,
+    why: ins.why || '',
+    affected_process: ins.affected_process || '',
+  }));
+
+  const intelligenceSheetRows = intelligenceTimeline.map((entry, index) => ({
+    row: index + 1,
+    tick: entry.tick,
+    updated_at: formatTime(entry.updated_at),
+    source: entry.source,
+    significant: entry.significant,
+    used_cache: entry.used_cache,
+    reason: entry.reason,
+    insight: entry.insight,
+    gemini_status: entry.gemini_status,
+    gemini_message: entry.gemini_message,
+  }));
+
+  const impactSheetRows = history.map((point, index) => ({
+    row: index + 1,
+    tick: point.time,
+    cpu_percent: Number(point.cpu || 0),
+    memory_percent: Number(point.memory || 0),
+    efficiency_percent: Number(point.efficiency || 0),
+    latency_percent: Number(point.latency || 0),
+    stability_percent: Number(point.stability || 0),
+    baseline_cpu_percent: Number(point.unop_cpu || 0),
+  }));
 
   const trackedProcesses = (gameState.processes || []).filter(
     (p) => p.pid !== 0 && !p.name.includes('Idle') && p.name !== 'System'
@@ -896,6 +1167,10 @@ function App() {
 
         <div className="toggle-panel">
           <span className="font-bold text-sm">IARIS ORCHESTRATOR</span>
+          <button className="btn" onClick={manualRefreshFromApi} disabled={isManualRefreshing} style={{ marginBottom: 8 }}>
+            <RefreshCw size={14} className={isManualRefreshing ? 'animate-spin' : ''} />
+            {isManualRefreshing ? 'Refreshing...' : 'Refresh API'}
+          </button>
           <label className="switch">
             <input 
               type="checkbox" 
@@ -1627,30 +1902,65 @@ function App() {
         </div>
       </div>
       {/* ═════════════════════════════════════════════════════════════════════
-          INSIGHT FEED — from backend engine (real data only)
+          GEMINI VISUAL SUMMARY BLOCKS
           ═════════════════════════════════════════════════════════════════════ */}
       <div className="glass-panel" style={{ marginTop: 16 }}>
         <div className="panel-header">
           <Shield size={18} color="var(--color-blue)" /> Intelligence Layer
-          <span className="badge badge-outline" style={{ marginLeft: 'auto' }}>
+          <span className={`badge ${geminiBadgeClass}`} style={{ marginLeft: 'auto' }}>
+            Gemini: {String(geminiMeta.status || 'unknown').replace(/_/g, ' ')}
+          </span>
+          <span className="badge badge-outline" style={{ marginLeft: 8 }}>
             {intelligence.used_cache ? 'cache reused' : 'fresh'}
           </span>
         </div>
         <div className="intelligence-summary-grid">
           <div className="metric-card" style={{ padding: '12px 14px' }}>
-            <div className="text-xs text-secondary" style={{ marginBottom: 6 }}>CURRENT INSIGHT</div>
+            <div className="text-xs text-secondary" style={{ marginBottom: 6 }}>INSIGHT SUMMARY</div>
             <div style={{ fontWeight: 600, lineHeight: 1.4 }}>{intelligence.insight || 'Awaiting meaningful change signal.'}</div>
             <div className="text-xs text-secondary" style={{ marginTop: 8 }}>
               Source: {intelligence.source} | Last updated: {formatTime(intelligence.last_updated)}
             </div>
           </div>
           <div className="metric-card" style={{ padding: '12px 14px' }}>
-            <div className="text-xs text-secondary" style={{ marginBottom: 6 }}>SIGNIFICANCE GATE</div>
-            <div style={{ fontWeight: 600, marginBottom: 6 }}>
+            <div className="text-xs text-secondary" style={{ marginBottom: 6 }}>RECOMMENDATION</div>
+            <div style={{ fontWeight: 600, lineHeight: 1.4 }}>
+              {recommendationForSummary?.recommendation || 'No recommendation yet. Keep the simulation running to gather more signal.'}
+            </div>
+            <div className="text-sm text-secondary" style={{ marginTop: 8 }}>
+              {recommendationForSummary?.message || 'The recommendation card updates when backend insights include actionable guidance.'}
+            </div>
+          </div>
+          <div className="metric-card" style={{ padding: '12px 14px' }}>
+            <div className="text-xs text-secondary" style={{ marginBottom: 6 }}>CONFIDENCE</div>
+            <div style={{ display: 'flex', alignItems: 'baseline', gap: 8 }}>
+              <span style={{ fontSize: 24, fontWeight: 700 }}>{confidenceScore}%</span>
+              <span className={`badge ${confidenceLabel === 'High' ? 'badge-green' : confidenceLabel === 'Medium' ? 'badge-yellow' : 'badge-outline'}`}>
+                {confidenceLabel}
+              </span>
+            </div>
+            <div className="text-sm text-secondary" style={{ marginTop: 8 }}>
               {intelligence.significant ? 'Meaningful change detected' : 'No meaningful change'}
             </div>
             <div className="text-sm text-secondary">Reason: {intelligence.reason || 'No reason available'}</div>
-            <div className="text-sm text-secondary">Current snapshot time: {formatTime(observability.snapshot?.timestamp)}</div>
+          </div>
+          <div className="metric-card" style={{ padding: '12px 14px' }}>
+            <div className="text-xs text-secondary" style={{ marginBottom: 6 }}>SOURCE HEALTH</div>
+            <div style={{ fontWeight: 600, marginBottom: 6 }}>
+              {geminiMeta.enabled ? 'Gemini path enabled' : 'Gemini path disabled'}
+            </div>
+            <div className="text-sm text-secondary">Status: {String(geminiMeta.status || 'unknown').replace(/_/g, ' ')}</div>
+            <div className="text-sm text-secondary">Detail: {geminiMeta.message || 'No status detail available.'}</div>
+            {(geminiMeta.model || geminiMeta.api_version) && (
+              <div className="text-xs text-secondary" style={{ marginTop: 6 }}>
+                Endpoint: {geminiMeta.model || 'n/a'} {geminiMeta.api_version ? `(${geminiMeta.api_version})` : ''}
+              </div>
+            )}
+            {intelligence.source !== 'gemini' && geminiMeta.attempted && (
+              <div className="text-xs" style={{ marginTop: 8, color: 'var(--color-yellow)' }}>
+                Fallback active: local summary used because Gemini did not return a usable response.
+              </div>
+            )}
           </div>
         </div>
       </div>
@@ -1709,6 +2019,61 @@ function App() {
             Engine is observing… insights will appear as patterns emerge.
           </div>
         )}
+      </div>
+
+      <div className="glass-panel" style={{ marginTop: 16 }}>
+        <div className="panel-header">
+          <ArrowDownToLine size={18} color="var(--accent-primary)" /> Download Sheets
+          <span className="badge badge-outline" style={{ marginLeft: 'auto' }}>
+            CSV + Excel
+          </span>
+        </div>
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(240px, 1fr))', gap: 12 }}>
+          <div className="metric-card" style={{ padding: '12px 14px' }}>
+            <div className="text-xs text-secondary" style={{ marginBottom: 8 }}>INSIGHTS SHEET</div>
+            <div className="text-sm text-secondary" style={{ marginBottom: 10 }}>
+              {insightsSheetRows.length} rows from current insight feed.
+            </div>
+            <div className="flex gap-2">
+              <button className="btn" onClick={() => exportDataset('insights', insightsSheetRows, 'csv')}>
+                CSV
+              </button>
+              <button className="btn" onClick={() => exportDataset('insights', insightsSheetRows, 'excel')}>
+                Excel
+              </button>
+            </div>
+          </div>
+
+          <div className="metric-card" style={{ padding: '12px 14px' }}>
+            <div className="text-xs text-secondary" style={{ marginBottom: 8 }}>INTELLIGENCE TIMELINE SHEET</div>
+            <div className="text-sm text-secondary" style={{ marginBottom: 10 }}>
+              {intelligenceSheetRows.length} rows with source and Gemini health history.
+            </div>
+            <div className="flex gap-2">
+              <button className="btn" onClick={() => exportDataset('intelligence-timeline', intelligenceSheetRows, 'csv')}>
+                CSV
+              </button>
+              <button className="btn" onClick={() => exportDataset('intelligence-timeline', intelligenceSheetRows, 'excel')}>
+                Excel
+              </button>
+            </div>
+          </div>
+
+          <div className="metric-card" style={{ padding: '12px 14px' }}>
+            <div className="text-xs text-secondary" style={{ marginBottom: 8 }}>IMPACT METRICS SHEET</div>
+            <div className="text-sm text-secondary" style={{ marginBottom: 10 }}>
+              {impactSheetRows.length} rows from visualization and impact trend telemetry.
+            </div>
+            <div className="flex gap-2">
+              <button className="btn" onClick={() => exportDataset('impact-metrics', impactSheetRows, 'csv')}>
+                CSV
+              </button>
+              <button className="btn" onClick={() => exportDataset('impact-metrics', impactSheetRows, 'excel')}>
+                Excel
+              </button>
+            </div>
+          </div>
+        </div>
       </div>
         </>
       )}
